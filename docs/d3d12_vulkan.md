@@ -2122,7 +2122,7 @@ The trace will enumerate them.
 
 | D3D12 / Xbox object | Vulkan / layer object | Notes |
 |---|---|---|
-| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
+| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 48 is called as `(desc, riid, out)` with `IID_ID3D12CommandQueue` (PC slot 48 is `OpenExistingHeapFromAddress`; the 32-byte desc is a PC `D3D12_COMMAND_QUEUE_DESC` plus four Xbox words, logged once, and the proxy takes the slot 8 path with the PC prefix and only `DISABLE_GPU_TIMEOUT` kept), slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
 | `ID3D12CommandQueue` | one leased `VkQueue` per live queue: direct queues on the graphics family, compute queues on an async-compute family and copy queues on a transfer-only (DMA) family when the GPU has them (`src/queue_families.h`), else graphics-family leases | Distinct Vulkan queues allow cross-queue waits and signals to make progress. With more than one family in use, buffers, images, the arena and staging are created `VK_SHARING_MODE_CONCURRENT` over those families, so no ownership transfers are needed. Barriers on copy and compute queues are narrowed to the stages their family has; render-target and depth clears are refused there (as in D3D12), and the D24/RGB96 copy conversions and bindless flushes stay off a transfer-only queue. Tested by `vk_queue_test`. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
 | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
 | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). `Draw` views are inlined and moved into the command stream (D3D-289), eliminating per-draw heap allocations. |
@@ -2259,6 +2259,12 @@ The trace will enumerate them.
   unknown types and node masks above 1 get an all-zero answer, logged. The test compares `DEFAULT`, `UPLOAD` and
   `READBACK` byte for byte with the host runtime's answer when the host adapter has the layer's architecture (RTX
   4090: identical); `d3d12_heap_properties` compares the `L1` heaps with the layer's own adapter.
+  The retail executable calls it (device slot 26) with the buffer for the returned struct in RCX and the device in
+  RDX, node mask in R8 and heap type in R9: three calls right after device creation, node mask 1 and types 1, 2
+  and 3 (measured under `gta6rt --run` with a register probe in the slot's thunk). A PC C++ method has the device
+  in RCX and the buffer in RDX, so the Xbox-ABI proxy takes the console form when RDX holds the proxy
+  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slots 25 and 43 return structs too; the
+  executable has not been seen calling them yet, so the proxy still forwards them in the PC form.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.

@@ -154,6 +154,47 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                         self.assertEqual(has_glc_store, bool(glc),
                                          f"glc={bool(glc)} mismatch for v0 write-back in guarded block")
 
+    def test_dynamic_exec_keeps_the_real_active_guard(self):
+        # Every other case here leaves EXEC alone, so the translator folds the guard to `if (%true)` (#4473) and
+        # find_guarded_texel_block accepts that constant. These shaders switch lanes off at run time, so the
+        # translator stores to %active and the atomic must be entered through a branch on the loaded %active: a
+        # lane the shader switched off must not reach OpImageTexelPointer / OpAtomic*. Both EXEC writes come from a
+        # per-lane compare (VCC), not from a computed SGPR value, which is SHADER-1264's path.
+        exec_writes = {
+            "and_saveexec": ["v_cmp_gt_u32_e32 vcc_lo, 2, v5", "s_and_saveexec_b32 s12, vcc_lo"],
+            "cmpx": ["v_cmpx_gt_u32_e32 2, v5"],
+        }
+        atomics = [
+            ("image_atomic_add", "v0", "dmask:0x1", "OpAtomicIAdd"),
+            ("image_atomic_swap", "v0", "dmask:0x1", "OpAtomicExchange"),
+            ("image_atomic_inc", "v0", "dmask:0x1", "OpAtomicCompareExchange"),
+            ("image_atomic_cmpswap", "v[0:1]", "dmask:0x3", "OpAtomicCompareExchange"),
+        ]
+        for form, pre in exec_writes.items():
+            for op, data, dmask, spv_op in atomics:
+                for dim, addr in (("dim:SQ_RSRC_IMG_2D", "v[1:2]"), ("dim:SQ_RSRC_IMG_3D", "v[1:3]")):
+                    with self.subTest(exec_write=form, op=op, dim=dim):
+                        spv = translate(pre + [
+                            "v_mov_b32_e32 v0, 5",
+                            "v_mov_b32_e32 v1, 1",
+                            "v_mov_b32_e32 v2, 2",
+                            "v_mov_b32_e32 v3, 3",
+                            f"{op} {data}, {addr}, s[4:11] {dmask} {dim} unorm glc",
+                        ])
+                        validate_spirv(spv)
+                        self.assertRegex(spv, r"(?m)^\s*OpStore %active\b",
+                                         "an EXEC write must reach %active, or this case tests nothing")
+                        (label, _insns), = find_guarded_texel_block(spv)
+                        self.assertIn(f"= {spv_op} %uint ", spv)
+                        # The walker must not accept the folded constant here: put %true in place of the real
+                        # condition and it has to reject the module.
+                        branch = re.search(rf"(?m)^\s*OpBranchConditional (%\w+) {re.escape(label)} ", spv)
+                        self.assertIsNotNone(branch, f"no conditional branch enters {label}")
+                        self.assertNotEqual(branch.group(1), "%true")
+                        forged = spv[:branch.start(1)] + "%true" + spv[branch.end(1):]
+                        with self.assertRaisesRegex(AssertionError, "unguarded block"):
+                            find_guarded_texel_block(forged)
+
     def test_image_atomic_inc_and_dec_cas_2d_3d_and_a16(self):
         cases = [
             ("image_atomic_inc", "dim:SQ_RSRC_IMG_2D", "v[1:2]", "", "OpUGreaterThanEqual"),

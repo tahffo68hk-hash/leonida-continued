@@ -694,6 +694,36 @@ void test_placeholders(const PhysicalApi& api) {
     check(reserved_only(base), "the rest of the placeholder is still reserved");
 }
 
+// Three of the retail executable's five physical-page windows carry 0x400 next to PAGE_READWRITE. That is
+// PAGE_WRITECOMBINE on the PC, outside the PAGE_GRAPHICS_* range, and MapViewOfFile3 refuses a view with it, so the
+// mapped pages take the window's protection without the cache modifier.
+void test_write_combine_window(const PhysicalApi& api) {
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x27,
+                          PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE));
+    check(window != nullptr, "XMemVirtualAlloc reserves a window with PAGE_WRITECOMBINE in its protection");
+    if (!window) return;
+
+    uint64_t page = 0;
+    uint64_t count = 1;
+    check(api.allocate(0x280, &count, &page) == TRUE && count == 1, "allocate a page for the write-combine window");
+    SetLastError(ERROR_SUCCESS);
+    const bool mapped = api.map(window, 1, &page) == window;
+    check(mapped, "a page maps into a window reserved with PAGE_WRITECOMBINE");
+    if (mapped) {
+        // Physical pages are committed on first touch, so the view is written before it is queried.
+        *static_cast<volatile unsigned char*>(window) = 1;
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(window, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+              "the page mapped there is a plain read-write view");
+        fill_page(window, 0x77000000u);
+        check(page_holds(window, 0x77000000u), "the page in the write-combine window holds data");
+    }
+    check(api.map(window, 1, nullptr) == window, "unmap the write-combine window");
+    check(api.free_pages(1, &page) == TRUE, "free the write-combine window's page");
+}
+
 // gta6rt --trace: one "xmem_attributes" event per distinct raw attribute word and API, none with the trace off.
 void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAllocFn virtual_alloc) {
     wchar_t temp[MAX_PATH];
@@ -942,6 +972,7 @@ int main() {
         test_commit_physical_pages(physical);
         test_first_touch_during_remap(physical);
         test_placeholders(physical);
+        test_write_combine_window(physical);
     }
 
     print_result();

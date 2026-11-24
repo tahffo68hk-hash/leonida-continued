@@ -36,6 +36,13 @@ struct Fake {
     VkImage blit_dst = VK_NULL_HANDLE;
     unsigned presents = 0;
     unsigned created_offscreen = 0;
+    // Failure injection for the failed-ResizeBuffers cases: the next N swapchain or image creations fail.
+    unsigned fail_swapchain_creates = 0;
+    unsigned fail_image_creates = 0;
+    unsigned swapchains_made = 0;
+    unsigned destroyed_images = 0;
+    VkSwapchainKHR live = VK_NULL_HANDLE;     // the swapchain that can acquire
+    VkSwapchainKHR retired = VK_NULL_HANDLE;  // retired by a vkCreateSwapchainKHR, failed or not
 };
 Fake g;
 
@@ -99,8 +106,16 @@ VKAPI_ATTR void VKAPI_CALL memory_properties(VkPhysicalDevice, VkPhysicalDeviceM
 VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreateInfoKHR* info,
                                                 const VkAllocationCallbacks*, VkSwapchainKHR* out) {
     if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
+    // The Vulkan rule this test leans on: oldSwapchain is retired even when creation fails.
+    if (info->oldSwapchain) g.retired = info->oldSwapchain;
+    if (g.fail_swapchain_creates) {
+        --g.fail_swapchain_creates;
+        if (g.live == info->oldSwapchain) g.live = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     g.create_min_image_count = info->minImageCount;
-    *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain);
+    *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain + 0x10 * g.swapchains_made++);
+    g.live = *out;
     return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*) {}
@@ -112,9 +127,10 @@ VKAPI_ATTR VkResult VKAPI_CALL get_images(VkDevice, VkSwapchainKHR, std::uint32_
     *count = g.returned_images;
     return VK_SUCCESS;
 }
-VKAPI_ATTR VkResult VKAPI_CALL acquire_next_image(VkDevice, VkSwapchainKHR, std::uint64_t, VkSemaphore, VkFence,
-                                                  std::uint32_t* out) {
+VKAPI_ATTR VkResult VKAPI_CALL acquire_next_image(VkDevice, VkSwapchainKHR swapchain, std::uint64_t, VkSemaphore,
+                                                  VkFence, std::uint32_t* out) {
     if (!out || g.returned_images == 0) return VK_ERROR_INITIALIZATION_FAILED;
+    if (swapchain != g.live) return VK_ERROR_OUT_OF_DATE_KHR;  // a retired swapchain cannot acquire
     g.last_acquired = g.acquire_cursor % g.returned_images;
     ++g.acquire_cursor;
     *out = g.last_acquired;
@@ -122,6 +138,7 @@ VKAPI_ATTR VkResult VKAPI_CALL acquire_next_image(VkDevice, VkSwapchainKHR, std:
 }
 VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue, const VkPresentInfoKHR* info) {
     if (!info || info->swapchainCount != 1 || !info->pImageIndices) return VK_ERROR_INITIALIZATION_FAILED;
+    if (!info->pSwapchains || info->pSwapchains[0] != g.live) return VK_ERROR_OUT_OF_DATE_KHR;
     g.presented_image = info->pImageIndices[0];
     ++g.presents;
     return VK_SUCCESS;
@@ -140,10 +157,14 @@ VKAPI_ATTR VkResult VKAPI_CALL device_wait_idle(VkDevice) { return VK_SUCCESS; }
 VKAPI_ATTR VkResult VKAPI_CALL create_image(VkDevice, const VkImageCreateInfo*, const VkAllocationCallbacks*,
                                             VkImage* out) {
     if (!out) return VK_ERROR_INITIALIZATION_FAILED;
+    if (g.fail_image_creates) {
+        --g.fail_image_creates;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     *out = reinterpret_cast<VkImage>(static_cast<std::uintptr_t>(kOffscreenBase + g.created_offscreen++));
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice, VkImage, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_image(VkDevice, VkImage, const VkAllocationCallbacks*) { ++g.destroyed_images; }
 VKAPI_ATTR void VKAPI_CALL image_mem_req(VkDevice, VkImage, VkMemoryRequirements* req) {
     std::memset(req, 0, sizeof(*req));
     req->size = 4096;
@@ -326,6 +347,63 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     return 0;
 }
 
+// Acquires and presents one frame on `swapchain`, which must still reach the live native swapchain.
+int present_one(const char* label, leonida::VulkanSwapchain& swapchain) {
+    std::uint32_t index = 0;
+    if (!swapchain.acquire_next_image(index)) {
+        std::fprintf(stderr, "FAIL: %s: acquire after the failed resize\n", label);
+        return 1;
+    }
+    const std::uint32_t current = swapchain.current_back_buffer_index();
+    if (current >= swapchain.image_count()) return fail("current index out of range after the failed resize");
+    g.presented_image = UINT32_MAX;
+    if (!swapchain.present(current) || g.presented_image == UINT32_MAX) {
+        std::fprintf(stderr, "FAIL: %s: present after the failed resize\n", label);
+        return 1;
+    }
+    return 0;
+}
+
+// After a failed ResizeBuffers the host's swap chain has no buffers (GetBuffer and Present are
+// DXGI_ERROR_INVALID_CALL; dxgi_swapchain_test compares that with the host), and the next successful
+// ResizeBuffers brings it back. This is the Vulkan side of that: whichever step fails (the offscreen ring, or
+// vkCreateSwapchainKHR, which retires the old swapchain even when it fails), a later resize still builds a
+// working swapchain, whether or not the native image count matches the request.
+int run_failed_resize(const char* label, std::uint32_t requested, std::uint32_t native, bool offscreen,
+                      bool fail_swapchain) {
+    g = Fake{};
+    g.min_image_count = 2;
+    g.returned_images = native;
+    std::mutex mutex;
+    leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
+                                      reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
+                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex);
+    if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
+                          VK_FORMAT_B8G8R8A8_UNORM, requested))
+        return fail("VulkanSwapchain::create");
+    if (swapchain.is_offscreen() != offscreen) return fail("unexpected path before the failed resize");
+    const VkSwapchainKHR before = g.live;
+
+    if (fail_swapchain) {
+        g.fail_swapchain_creates = 1;
+        if (swapchain.resize(64, 64)) return fail("resize succeeded although vkCreateSwapchainKHR failed");
+        if (g.retired != before || g.live) return fail("the failed create did not retire the old swapchain");
+    } else {
+        // 32x32 on a 64x64 surface needs an offscreen ring; its first image can't be made.
+        g.fail_image_creates = 1;
+        if (swapchain.resize(32, 32)) return fail("resize succeeded although the offscreen ring failed");
+    }
+    if (!swapchain.resize(64, 64)) {
+        std::fprintf(stderr, "FAIL: %s: the next resize did not recover\n", label);
+        return 1;
+    }
+    if (swapchain.image_count() != requested) return fail("the recovered swap chain changed the BufferCount");
+    if (swapchain.is_offscreen() != offscreen) return fail("the recovered swap chain took another path");
+    for (int frame = 0; frame < 3; ++frame)
+        if (const int r = present_one(label, swapchain)) return r;
+    return 0;
+}
+
 struct Case {
     const char* label;
     std::uint32_t requested;
@@ -349,7 +427,24 @@ int main() {
     for (const Case& c : cases) {
         if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen)) return result;
     }
+    struct FailCase {
+        const char* label;
+        std::uint32_t requested;
+        std::uint32_t native;
+        bool offscreen;
+        bool fail_swapchain;
+    };
+    const FailCase fail_cases[] = {
+        {"offscreen ring, vkCreateSwapchainKHR fails", 2, 4, true, true},
+        {"offscreen ring, the new ring fails", 2, 4, true, false},
+        {"matching counts, vkCreateSwapchainKHR fails", 3, 3, true, true},
+        {"matching counts, the new ring fails", 3, 3, true, false},
+    };
+    for (const FailCase& c : fail_cases) {
+        if (const int result = run_failed_resize(c.label, c.requested, c.native, c.offscreen, c.fail_swapchain))
+            return result;
+    }
     std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min)\n");
+                "request above min; 4 failed-resize cases)\n");
     return 0;
 }

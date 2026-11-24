@@ -777,7 +777,9 @@ void run_checks(const std::filesystem::path& root) {
         check(move_w(L"GAME:\\misc", L"GAME:\\misc2") == FALSE && GetLastError() == ERROR_ACCESS_DENIED,
               "a package folder is not moved");
         SetLastError(0);
-        check(move_w(L"GAME:\\misc\\keep.txt", (root / "host.txt").c_str()) == FALSE &&
+        // G: and T: outside the configured roots are console aliases, even when TEMP uses that host drive.
+        // Paths within the synthetic package root are explicitly host paths on every drive.
+        check(move_w(L"GAME:\\misc\\keep.txt", (package / "host.txt").c_str()) == FALSE &&
                   GetLastError() == ERROR_NOT_SAME_DEVICE,
               "a move between GAME: and a host path is refused as cross-volume");
         SetLastError(0);
@@ -821,7 +823,8 @@ void run_checks(const std::filesystem::path& root) {
         check(copy_a("GAME:\\misc\\keep.txt", "GAME:\\misc\\target.txt", FALSE) != FALSE &&
                   read_path(overlay / "misc" / "target.txt") == "keep" && read_path(package / "misc" / "target.txt") == "target",
               "CopyFileA overwrites through the overlay and leaves the package file alone");
-        const std::filesystem::path host_copy = root / "host_copy.txt";
+        // Keep this host path inside a configured root too; an unqualified G:/T: path is virtual.
+        const std::filesystem::path host_copy = package / "host_copy.txt";
         check(copy_w(L"GAME:\\misc\\keep.txt", host_copy.c_str(), TRUE) != FALSE && read_path(host_copy) == "keep",
               "a copy from GAME: to a host path works");
         check(copy_ex_w(host_copy.c_str(), L"GAME:\\cache\\from_host.txt", nullptr, nullptr, nullptr, COPY_FILE_FAIL_IF_EXISTS) !=

@@ -305,6 +305,7 @@ public:
         if ((flags & DXGI_PRESENT_ALLOW_TEARING) &&
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
+        if (lost_) return DXGI_ERROR_INVALID_CALL;  // host-measured: no buffers after a failed ResizeBuffers
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
         const std::uint32_t cur = swapchain_.current_back_buffer_index();
         if (!swapchain_.present(cur)) return E_FAIL;
@@ -334,17 +335,30 @@ public:
     HRESULT STDMETHODCALLTYPE GetDesc(DXGI_SWAP_CHAIN_DESC* desc) override {
         if (!desc) return E_INVALIDARG;
         std::memset(desc, 0, sizeof(*desc));
-        desc->BufferDesc.Width = swapchain_.extent().width;
-        desc->BufferDesc.Height = swapchain_.extent().height;
-        desc->BufferDesc.Format = vk_to_dxgi_format(swapchain_.format());
+        desc->BufferDesc.Width = lost_ ? lost_width_ : swapchain_.extent().width;
+        desc->BufferDesc.Height = lost_ ? lost_height_ : swapchain_.extent().height;
+        desc->BufferDesc.Format = current_format();
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = buffer_usage_;
-        desc->BufferCount = swapchain_.image_count();
+        desc->BufferCount = lost_ ? lost_count_ : swapchain_.image_count();
         desc->OutputWindow = hwnd_;
         desc->Windowed = TRUE;
         desc->SwapEffect = swap_effect_;
         desc->Flags = flags_;
         return S_OK;
+    }
+
+    // The swap chain's format as GetDesc reports it.
+    DXGI_FORMAT current_format() const { return lost_ ? lost_format_ : vk_to_dxgi_format(swapchain_.format()); }
+
+    // A failed ResizeBuffers (see resize_buffers): no buffers until the next successful one, and the description
+    // reports what was asked for.
+    void lose_buffers(std::uint32_t width, std::uint32_t height, UINT count, DXGI_FORMAT format) {
+        lost_ = true;
+        lost_width_ = width;
+        lost_height_ = height;
+        lost_count_ = count;
+        lost_format_ = format;
     }
 
     HRESULT STDMETHODCALLTYPE ResizeBuffers(UINT count, UINT width, UINT height, DXGI_FORMAT fmt, UINT flags) override {
@@ -374,18 +388,37 @@ public:
         // DXGI refuses to resize while the app still holds a back buffer reference.
         for (auto* bb : buffers_)
             if (bb->held_by_app()) return DXGI_ERROR_INVALID_CALL;
-        const std::size_t target_count = count ? count : buffers_.size();
+        const std::size_t target_count = count ? count : (lost_ ? lost_count_ : buffers_.size());
         if (node_masks && !std::all_of(node_masks, node_masks + target_count, [](UINT mask) { return mask <= 1; }))
             return DXGI_ERROR_INVALID_CALL;
         if (present_queues && !std::all_of(present_queues, present_queues + target_count, is_direct_present_queue))
             return DXGI_ERROR_INVALID_CALL;
         unregister_buffers();
-        const VkExtent2D size = size_or_client(width, height, swapchain_.extent());
+        const VkExtent2D size = size_or_client(width, height, lost_ ? VkExtent2D{lost_width_, lost_height_}
+                                                                     : swapchain_.extent());
         const std::uint32_t w = size.width;
         const std::uint32_t h = size.height;
         const UINT next_flags = flags ? flags : flags_;
         const bool allow_tearing = (next_flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
-        if (!swapchain_.resize(w, h, vk_fmt, count, allow_tearing)) return E_FAIL;
+        // Host-measured (RTX 3060 Ti / NVIDIA 610.88 and WARP): once the arguments are accepted, the old buffers are
+        // gone. When the new ones can't be made, ResizeBuffers fails and the swap chain stays without buffers: its
+        // description already has the new size and count, GetBuffer and Present are DXGI_ERROR_INVALID_CALL, and the
+        // next successful ResizeBuffers brings it back. A side above 16384 is E_INVALIDARG on the hardware device
+        // (WARP takes 16385 and answers E_OUTOFMEMORY at 32768); a Vulkan failure here is E_OUTOFMEMORY.
+        // The size check also keeps vkCreateImage from an extent past the device's limits.
+        const DXGI_FORMAT next_format = fmt != DXGI_FORMAT_UNKNOWN ? fmt : current_format();
+        if (w > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION || h > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION) {
+            lose_buffers(w, h, static_cast<UINT>(target_count), next_format);
+            return E_INVALIDARG;
+        }
+        // Format UNKNOWN keeps the swap chain's format, which after a failed ResizeBuffers is the one it asked for.
+        const VkFormat resize_format = vk_fmt != VK_FORMAT_UNDEFINED ? vk_fmt
+                                       : lost_ ? dxgi_to_vk_format(lost_format_) : VK_FORMAT_UNDEFINED;
+        if (!swapchain_.resize(w, h, resize_format, static_cast<std::uint32_t>(target_count), allow_tearing)) {
+            lose_buffers(w, h, static_cast<UINT>(target_count), next_format);
+            return E_OUTOFMEMORY;
+        }
+        lost_ = false;
         source_size_ = {w, h};  // host-measured: ResizeBuffers resets the source region to the new back buffers
         statistics_disjoint_.store(true, std::memory_order_relaxed);
         flags_ = next_flags;
@@ -462,12 +495,12 @@ public:
     HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_SWAP_CHAIN_DESC1* desc) override {
         if (!desc) return E_INVALIDARG;
         std::memset(desc, 0, sizeof(*desc));
-        desc->Width = swapchain_.extent().width;
-        desc->Height = swapchain_.extent().height;
-        desc->Format = vk_to_dxgi_format(swapchain_.format());
+        desc->Width = lost_ ? lost_width_ : swapchain_.extent().width;
+        desc->Height = lost_ ? lost_height_ : swapchain_.extent().height;
+        desc->Format = current_format();
         desc->SampleDesc.Count = 1;
         desc->BufferUsage = buffer_usage_;
-        desc->BufferCount = swapchain_.image_count();
+        desc->BufferCount = lost_ ? lost_count_ : swapchain_.image_count();
         desc->Scaling = DXGI_SCALING_STRETCH;
         desc->SwapEffect = swap_effect_;
         desc->AlphaMode = DXGI_ALPHA_MODE_IGNORE;
@@ -530,8 +563,9 @@ public:
     // IDXGISwapChain2
     HRESULT STDMETHODCALLTYPE SetSourceSize(UINT width, UINT height) override {
         // Host-measured: a region larger than either back-buffer dimension is refused and keeps the stored one;
-        // zero is accepted. Present does not scale by it yet (documented difference).
-        const VkExtent2D extent = swapchain_.extent();
+        // zero is accepted. Present does not scale by it yet (documented difference). After a failed ResizeBuffers
+        // the host checks against the size that was asked for (16x16385 refuses 100x10, 16385x16 takes it).
+        const VkExtent2D extent = lost_ ? VkExtent2D{lost_width_, lost_height_} : swapchain_.extent();
         if (width > extent.width || height > extent.height) return DXGI_ERROR_INVALID_CALL;
         source_size_ = {width, height};
         return S_OK;
@@ -642,6 +676,11 @@ private:
     DXGI_USAGE buffer_usage_ = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     HANDLE waitable_ = nullptr;
     std::vector<BackBufferResource*> buffers_;
+    bool lost_ = false;  // after a failed ResizeBuffers: no buffers, the description below
+    std::uint32_t lost_width_ = 0;
+    std::uint32_t lost_height_ = 0;
+    UINT lost_count_ = 0;
+    DXGI_FORMAT lost_format_ = DXGI_FORMAT_UNKNOWN;
     std::atomic<UINT> present_count_{0};
     std::atomic<bool> statistics_disjoint_{true};
     std::atomic<LONGLONG> last_present_qpc_{0};

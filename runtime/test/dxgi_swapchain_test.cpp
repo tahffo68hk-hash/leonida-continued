@@ -307,6 +307,138 @@ int compare_swap_chain_arguments(IDXGIFactory4* ours, ID3D12Device* our_device, 
     return mismatches;
 }
 
+// A failed ResizeBuffers, against the host runtime's DXGI. Measured on an RTX 3060 Ti (NVIDIA 610.88): a side
+// above 16384 is E_INVALIDARG, and then the swap chain has no buffers. GetDesc1 reports the size that was asked for,
+// GetBuffer and Present are DXGI_ERROR_INVALID_CALL, and the next ResizeBuffers to a valid size brings it all back.
+// A refused call (a back buffer still held) changes nothing. WARP differs (it takes 16385 and fails at 32768 with
+// E_OUTOFMEMORY), so this compares with the host's default adapter. Returns the number of mismatches, or -1 without
+// a host D3D12 device.
+int compare_failed_resize(IDXGIFactory4* ours, ID3D12CommandQueue* our_queue) {
+    using CreateDevice = HRESULT(WINAPI*)(IUnknown*, D3D_FEATURE_LEVEL, REFIID, void**);
+    using CreateFactory2 = HRESULT(WINAPI*)(UINT, REFIID, void**);
+    const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    const auto create_device = d3d12 ? reinterpret_cast<CreateDevice>(
+                                           reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
+                                     : nullptr;
+    const auto create_factory = dxgi ? reinterpret_cast<CreateFactory2>(
+                                           reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory2")))
+                                     : nullptr;
+    ID3D12Device* host_device = nullptr;
+    IDXGIFactory4* host_factory = nullptr;
+    ID3D12CommandQueue* host_queue = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT, 0, D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
+    if (!create_device || !create_factory ||
+        FAILED(create_device(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host_device))) ||
+        FAILED(create_factory(0, IID_PPV_ARGS(&host_factory))) ||
+        FAILED(host_device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&host_queue)))) {
+        if (host_factory) host_factory->Release();
+        if (host_device) host_device->Release();
+        return -1;
+    }
+    DXGI_SWAP_CHAIN_DESC1 base{};
+    base.Width = 64;
+    base.Height = 64;
+    base.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    base.SampleDesc.Count = 1;
+    base.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    base.BufferCount = 2;
+    base.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    static const char* const kSteps[] = {
+        "ResizeBuffers(2, 16385, 16)",
+        "GetDesc1 width",
+        "GetDesc1 height",
+        "GetDesc1 BufferCount",
+        "GetBuffer(0) after it",
+        "Present after it",
+        "ResizeBuffers(2, 16, 16385)",
+        "SetSourceSize(100, 10) while 16x16385 is asked for",
+        "SetSourceSize(16, 16) while 16x16385 is asked for",
+        "ResizeBuffers(0, 64, 64) after both",
+        "GetDesc1 width after",
+        "GetDesc1 BufferCount after",
+        "GetBuffer(0) after recovering",
+        "Present after recovering",
+        "ResizeBuffers with buffer 0 held",
+        "GetDesc1 width after the refused call",
+        "Present after the refused call",
+    };
+    std::vector<long> results[2];
+    for (int side = 0; side < 2; ++side) {
+        IDXGIFactory4* factory = side ? host_factory : ours;
+        IUnknown* queue = side ? static_cast<IUnknown*>(host_queue) : static_cast<IUnknown*>(our_queue);
+        HWND hwnd = create_test_window(64, 64);
+        IDXGISwapChain1* chain1 = nullptr;
+        IDXGISwapChain3* chain = nullptr;
+        if (FAILED(factory->CreateSwapChainForHwnd(queue, hwnd, &base, nullptr, nullptr, &chain1)) ||
+            FAILED(chain1->QueryInterface(IID_PPV_ARGS(&chain)))) {
+            if (chain1) chain1->Release();
+            DestroyWindow(hwnd);
+            continue;
+        }
+        std::vector<long>& r = results[side];
+        const auto desc = [&](int field) {
+            DXGI_SWAP_CHAIN_DESC1 d{};
+            chain->GetDesc1(&d);
+            return static_cast<long>(field == 0 ? d.Width : field == 1 ? d.Height : d.BufferCount);
+        };
+        const auto get_buffer = [&] {
+            ID3D12Resource* buffer = nullptr;
+            const HRESULT hr = chain->GetBuffer(0, IID_PPV_ARGS(&buffer));
+            if (buffer) buffer->Release();
+            return static_cast<long>(hr);
+        };
+        // The host answers DXGI_STATUS_OCCLUDED (a success) for a window that isn't on screen, which depends on the
+        // desktop rather than on the swap chain; that counts as S_OK here. The failures stay strict.
+        const auto present = [&] {
+            const HRESULT hr = chain->Present(0, 0);
+            return static_cast<long>(hr == DXGI_STATUS_OCCLUDED ? S_OK : hr);
+        };
+        r.push_back(chain->ResizeBuffers(2, 16385, 16, DXGI_FORMAT_UNKNOWN, 0));
+        r.push_back(desc(0));
+        r.push_back(desc(1));
+        r.push_back(desc(2));
+        r.push_back(get_buffer());
+        r.push_back(present());
+        r.push_back(chain->ResizeBuffers(2, 16, 16385, DXGI_FORMAT_UNKNOWN, 0));
+        r.push_back(chain->SetSourceSize(100, 10));
+        r.push_back(chain->SetSourceSize(16, 16));
+        r.push_back(chain->ResizeBuffers(0, 64, 64, DXGI_FORMAT_UNKNOWN, 0));
+        r.push_back(desc(0));
+        r.push_back(desc(2));
+        r.push_back(get_buffer());
+        r.push_back(present());
+        ID3D12Resource* held = nullptr;
+        chain->GetBuffer(0, IID_PPV_ARGS(&held));
+        r.push_back(chain->ResizeBuffers(2, 32, 32, DXGI_FORMAT_UNKNOWN, 0));
+        if (held) held->Release();
+        r.push_back(desc(0));
+        r.push_back(present());
+        chain->Release();
+        chain1->Release();
+        DestroyWindow(hwnd);
+    }
+    host_queue->Release();
+    host_factory->Release();
+    host_device->Release();
+    if (results[0].size() != std::size(kSteps) || results[1].size() != std::size(kSteps)) {
+        std::fprintf(stderr, "failed ResizeBuffers: a swap chain could not be created (ours %zu, host %zu steps)\n",
+                     results[0].size(), results[1].size());
+        return 1;
+    }
+    int mismatches = 0;
+    for (std::size_t i = 0; i < std::size(kSteps); ++i) {
+        if (results[0][i] != results[1][i]) {
+            ++mismatches;
+            std::fprintf(stderr, "failed ResizeBuffers, %s: ours 0x%08lx, host 0x%08lx\n", kSteps[i],
+                         static_cast<unsigned long>(results[0][i]), static_cast<unsigned long>(results[1][i]));
+        }
+    }
+    std::printf("failed ResizeBuffers: %zu steps compared with the host runtime, %d mismatches\n", std::size(kSteps),
+                mismatches);
+    return mismatches;
+}
+
 int main() {
     if (!has_interactive_window_station()) {
         // The host answers DXGI_ERROR_NOT_CURRENTLY_AVAILABLE to every CreateSwapChainForHwnd there: nothing to compare.
@@ -509,6 +641,9 @@ int main() {
     const int argument_mismatches = compare_swap_chain_arguments(factory, dev, queue);
     if (argument_mismatches < 0) std::printf("CreateSwapChainForHwnd: no host D3D12 device to compare with, skipped\n");
     if (argument_mismatches > 0) return fail("CreateSwapChainForHwnd answers differ from the host runtime");
+    const int resize_mismatches = compare_failed_resize(factory, queue);
+    if (resize_mismatches < 0) std::printf("failed ResizeBuffers: no host D3D12 device to compare with, skipped\n");
+    if (resize_mismatches > 0) return fail("a failed ResizeBuffers differs from the host runtime");
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
     scd.Width = 128;

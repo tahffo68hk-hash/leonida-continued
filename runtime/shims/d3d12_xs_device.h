@@ -1,12 +1,24 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
+//   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
+//             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9). A PC C++ method has
+//             the device in RCX and the buffer in RDX. The thunk takes the console form when RDX holds a device
+//             proxy, and forwards the PC form otherwise. Slots 25 and 43 return structs too; no call of them by
+//             the executable has been seen yet, so they are forwarded in the PC form.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
+//   slot 70   (texture words, view desc, destination handle), no return value: a shader-resource view from raw words
+//             and a GPU address, with no resource (retail boot chain stop 14). The PC slot 70 is CreatePlacedResource1.
+//             The words are not measured, so the destination gets the PC null view (PC CreateShaderResourceView
+//             with no resource) and the call returns.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+//   slot 127  CreateCommittedResource3 (heap, flags, desc1, layout, clear, session, castable count/list, riid, out) ->
+//             PC ID3D12Device10::CreateCommittedResource3 (PC slot 76), with the Xbox layout word replaced and the
+//             Xbox flag bits dropped (RT-5 stop 15, docs/retail_boot_chain.md). E_NOTIMPL when the PC device lacks it.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
@@ -18,6 +30,9 @@
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
+//   slot 26   GetCustomHeapProperties, called by the retail title with the C ABI: return buffer in RCX, the device
+//             in RDX (the PC form is `this` in RCX, return buffer in RDX). Slot 25 (GetResourceAllocationInfo, also a
+//             struct wider than 8 bytes) takes the same form by the same rule. Both accept either form.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -118,8 +133,9 @@ using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12
 void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
 
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
+// proxies), 9 (allocator proxies), 14, 26 (the console's struct-return form),
+// 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
+// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67, 70, 76 and 127. Slot 10 is intentionally false: the
 // measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
 // handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
