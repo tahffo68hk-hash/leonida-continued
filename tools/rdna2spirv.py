@@ -9563,9 +9563,8 @@ class Gen:
             #   v_sad_u16:   S2 + sum over the 2 halves of |S0.h - S1.h|
             #   v_sad_u32:   S2 + |S0 - S1|
             #   v_msad_u8:   v_sad_u8, skipping each byte where S1's byte is 0 (masked SAD)
-            # clamp is not modelled: rejected rather than guessed.
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
+            # Measured natively on AMD RDNA2 (gfx1036, wave32 & wave64, tools/int_hw_probe.py --group valu_sad_clamp):
+            # VOP3 clamp saturates the 32-bit unsigned sum (total + acc) to 0xFFFFFFFF on overflow.
             x, y, acc = (self.src_u(t) for t in a[1:4])
             width = {"v_sad_u16": 16, "v_sad_u32": 32}.get(op, 8)
             total = None
@@ -9596,6 +9595,11 @@ class Gen:
                 total = t
             r = self.tmp()
             self.emit(f"{r} = OpIAdd %uint {total} {acc}")
+            if "clamp" in mods:
+                ov, cl = self.tmp(), self.tmp()
+                self.emit(f"{ov} = OpULessThan %bool {r} {acc}")
+                self.emit(f"{cl} = OpSelect %uint {ov} {self.cu(0xFFFFFFFF)} {r}")
+                r = cl
             self.dst(a[0], r)
         elif op == "v_mqsad_u32_u8":
             # Four masked byte-SADs with full 32-bit accumulators (RDNA ISA pseudocode): for k = 0..3,

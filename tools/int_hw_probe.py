@@ -20,6 +20,7 @@ Groups covered (each references its contract row in docs/design.md):
     valu_mad64          v_mad_u64_u32, v_mad_i64_i32 (sdst bit 64 and inactive EXEC lane)
     valu_sad_lerp       v_sad_u8, v_sad_hi_u8, v_sad_u16, v_sad_u32, v_msad_u8, v_lerp_u8
     valu_qsad_mqsad     v_qsad_pk_u16_u8, v_mqsad_pk_u16_u8, v_mqsad_u32_u8
+    valu_sad_clamp      VOP3 clamp saturation across v_sad_*/v_msad_u8/v_qsad_*/v_mqsad_*
     valu_mul24_sh64     v_mul_hi_u32_u24, v_mul_hi_i32_i24, v_lshrrev_b64, v_ashrrev_i64
     valu_mad16          v_mad_u16, v_mad_i16 (clamp, op_sel, kept half)
     valu_cvt_16         v_cvt_f16_u16/i16, v_cvt_u16/i16_f16 (kept half, op_sel, NaN, inf)
@@ -489,6 +490,40 @@ def build_cases():
             "v_mov_b32 v14, 20", "v_mov_b32 v15, 0xffffffff",
             "v_mqsad_u32_u8 v[8:11], v[2:3], v4, v[12:15]",
         ], "v_mqsad_u32_u8 four 32-bit accumulators with wrap"),
+    ]
+
+    # 14b. VOP3 clamp across the entire SAD / QSAD / MQSAD family
+    cases += [
+        _valu4_case("valu_sad_clamp", "v_sad_clamp_32", [
+            "v_mov_b32 v1, 0xff00ff00", "v_mov_b32 v2, 0x00ff00ff", "v_mov_b32 v3, 0xfffffff0",
+            "v_sad_u8 v8, v1, v2, v3 clamp",       # saturates to 0xFFFFFFFF
+            "v_sad_hi_u8 v9, v1, v2, v3 clamp",    # saturates to 0xFFFFFFFF
+            "v_sad_u16 v10, v1, v2, v3 clamp",     # saturates to 0xFFFFFFFF
+            "v_sad_u32 v11, v1, v2, v3 clamp",     # saturates to 0xFFFFFFFF
+        ], "v_sad_u8 / v_sad_hi_u8 / v_sad_u16 / v_sad_u32 clamp saturation"),
+        _valu4_case("valu_sad_clamp", "v_msad_sad32_clamp", [
+            "v_mov_b32 v1, 0xff00ff00", "v_mov_b32 v2, 0x00ff00ff", "v_mov_b32 v3, 0xfffffff0",
+            "v_msad_u8 v8, v1, v2, v3 clamp",      # masked byte SAD saturates to 0xFFFFFFFF
+            "v_mov_b32 v4, 100",
+            "v_msad_u8 v9, v1, v2, v4 clamp",      # non-overflow stays exact (100 + 510 = 610)
+            "v_mov_b32 v5, 0xffffffff", "v_mov_b32 v6, 0",
+            "v_sad_u32 v10, v5, v6, v5",           # plain wrap: 0xFFFFFFFE
+            "v_sad_u32 v11, v5, v6, v5 clamp",     # max+max saturates to 0xFFFFFFFF
+        ], "v_msad_u8 and v_sad_u32 max+max clamp saturation vs non-overflow"),
+        _valu4_case("valu_sad_clamp", "v_qsad_mqsad_pk_u16_clamp", [
+            "v_mov_b32 v2, 0x40302010", "v_mov_b32 v3, 0x80706050",
+            "v_mov_b32 v4, 0x00150025",
+            "v_mov_b32 v6, 0xfffe0005", "v_mov_b32 v7, 0xfff00100",
+            "v_qsad_pk_u16_u8 v[8:9], v[2:3], v4, v[6:7] clamp",
+            "v_mqsad_pk_u16_u8 v[10:11], v[2:3], v4, v[6:7] clamp",
+        ], "v_qsad_pk_u16_u8 and v_mqsad_pk_u16_u8 per-16-bit-lane clamp saturation"),
+        _valu4_case("valu_sad_clamp", "v_mqsad_u32_u8_clamp", [
+            "v_mov_b32 v2, 0x40302010", "v_mov_b32 v3, 0x80706050",
+            "v_mov_b32 v4, 0x00150025",
+            "v_mov_b32 v12, 0xfffffffe", "v_mov_b32 v13, 10",
+            "v_mov_b32 v14, 20", "v_mov_b32 v15, 0xffffffff",
+            "v_mqsad_u32_u8 v[8:11], v[2:3], v4, v[12:15] clamp",
+        ], "v_mqsad_u32_u8 per-32-bit-lane clamp saturation"),
     ]
 
     # 15. v_mul_hi_u32_u24, v_mul_hi_i32_i24, v_lshrrev_b64, v_ashrrev_i64

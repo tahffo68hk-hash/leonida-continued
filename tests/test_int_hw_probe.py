@@ -178,5 +178,28 @@ class ValuBfeMeasuredOnRdna2(unittest.TestCase):
                 self.assertEqual(got[name], want)
 
 
+# SAD/QSAD/MQSAD VOP3 clamp words measured natively on AMD Radeon Graphics (gfx1036, RDNA2, Windows 11),
+# wave32 and wave64 identical: `python -I tools/int_hw_probe.py --oracle both --wave both --group valu_sad_clamp`.
+# Every op in the family saturates each unsigned output lane independently on overflow: [0, 0xFFFFFFFF] for the
+# five 32-bit scalar SAD ops and v_mqsad_u32_u8, and [0, 0xFFFF] per 16-bit lane for v_qsad_pk_u16_u8 and
+# v_mqsad_pk_u16_u8. Also verified bit-exact on NVIDIA RTX 5060 Ti (Wave32 & Wave64-emulate + spirv-val).
+VALU_SAD_CLAMP_GFX1036 = {
+    "v_sad_clamp_32": [0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF],
+    "v_msad_sad32_clamp": [0xFFFFFFFF, 0x00000262, 0xFFFFFFFE, 0xFFFFFFFF],
+    "v_qsad_mqsad_pk_u16_clamp": [0xFFFF0095, 0xFFFF01E6, 0xFFFF0035, 0xFFFF0146],
+    "v_mqsad_u32_u8_clamp": [0xFFFFFFFF, 0x0000003A, 0x0000005A, 0xFFFFFFFF],
+}
+
+
+class ValuSadClampMeasuredOnRdna2(unittest.TestCase):
+    def test_translator_gives_the_gfx1036_words(self):
+        cases = [c for c in probe.build_cases() if c.group == "valu_sad_clamp"]
+        self.assertEqual(sorted(c.name for c in cases), sorted(VALU_SAD_CLAMP_GFX1036))
+        got = probe.run_translator(cases)
+        for name, want in VALU_SAD_CLAMP_GFX1036.items():
+            with self.subTest(case=name):
+                self.assertEqual(got[name], want)
+
+
 if __name__ == "__main__":
     unittest.main()

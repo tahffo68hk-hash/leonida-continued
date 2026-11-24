@@ -123,9 +123,27 @@ class SadTests(unittest.TestCase):
         self.assertEqual(run_lines(["s_mov_b32 s2, 0x01010101", "v_mov_b32 v1, 0x03030303", "v_sad_u8 v0, s2, v1, 7"]),
                          7 + 4 * 2)
 
-    def test_clamp_is_rejected_not_guessed(self):
-        with self.assertRaises(rdna2spirv.Unsupported):
-            run_lines(["v_mov_b32 v1, 1", "v_sad_u8 v0, v1, v1, v1 clamp"])
+    def test_clamp_saturates_to_u32_max(self):
+        # Measured natively on AMD gfx1036 (wave32 & wave64, tools/int_hw_probe.py --group valu_sad_clamp):
+        # VOP3 clamp saturates all five scalar SAD ops to 0xFFFFFFFF on 32-bit unsigned overflow.
+        for op, fn in OPS.items():
+            for x, y, z in (
+                (0xFF00FF00, 0x00FF00FF, 0xFFFFFFF0),
+                (0xFFFFFFFF, 0x00000000, 0xFFFFFFFF),
+                (0x01020304, 0x04030201, 10),
+                (0x10203040, 0x00200030, 0xFFFFFFF0),
+            ):
+                base = fn(x, y, 0)
+                exact = base + z
+                want = min(exact, 0xFFFFFFFF)
+                with self.subTest(op=op, x=hex(x), y=hex(y), z=hex(z)):
+                    got = run_lines([
+                        f"v_mov_b32 v1, {x:#x}",
+                        f"v_mov_b32 v2, {y:#x}",
+                        f"v_mov_b32 v3, {z:#x}",
+                        f"{op} v0, v1, v2, v3 clamp",
+                    ])
+                    self.assertEqual(got, want)
 
 
 if __name__ == "__main__":
